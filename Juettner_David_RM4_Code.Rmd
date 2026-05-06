@@ -1,0 +1,569 @@
+---
+title: "PosterProjectMetIV"
+author: "David Jüttner"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+## Setup 
+
+DV: "Thinking about the conflict in Ukraine, to what extent would you support or oppose each of the following? Ukraine fast-tracking European Union membership" (ukraine_memb) --> Ordinal variable ranging from 1 (Strongly support) - 4 (Strongly oppose) --> I recode this so the values are 1 (strongly oppose) - 4 (strongly support)
+
+Methods: OLS (as the baseline model), Lasso, Ridge, Random Forest
+
+The file can take around 15 minutes to run.
+
+```{r - General Setup}
+
+library(tidyverse)
+library(glmnet)
+library(tidymodels)
+library(ranger)
+library(knitr)
+library(ggplot2)
+library(doParallel)
+library(tune)
+
+# Set your working directory
+
+setwd()
+
+# Load the data
+
+sie_original <- read.csv("2018_2024_trendfile_dataset.csv")
+
+```
+
+```{r - Data Wrangling}
+
+# I only choose observations and respective variables which are available for the year when my outcome variabe "ukraine_memb" was ask (2022-2024)
+
+sie_working <- sie_original %>% 
+  select(ukraine_memb, govrec, starts_with("active_role"), 
+         starts_with("country_issues"), starts_with("personal_issues"), 
+         referendum, eu_optimism, country_influential, voice_ineu, 
+         govtrust20222024, eutrust20222024, euresource_interests, euresource_taxes,
+         countrythreat20222024, europeanarmy, crisis_natural_disaster, crisis_debt,
+         crisis_unemployment, crisis_refugees, crisis_climate_ch, crisis_pandemic, 
+         crisis_military_attack, democsatisfaction_country, democsatisfaction_eu, 
+         selfidentity, countrydefence, russia, natoimportance, 
+         pastvote, party_name_short_parlgov, family_name_parlgov, left_right_parlgov,
+         starts_with("euled"), leftright, ukraine_refugees, economicsituation, 
+         areatype, work, age_c, education, gender) %>% 
+  filter(ukraine_memb < 5) %>% 
+  # Coding the relevant values for NAs
+  mutate(govrec = na_if(govrec, 3),
+         referendum = na_if(referendum, 4),
+         eu_optimism = na_if(eu_optimism, 5),
+         country_influential = na_if(country_influential, 6),
+         govtrust20222024 = na_if(govtrust20222024, 5),
+         eutrust20222024 = na_if(eutrust20222024, 5),
+         euresource_taxes = na_if(euresource_taxes, 3),
+         countrythreat20222024 = na_if(countrythreat20222024, 7),
+         europeanarmy = na_if(europeanarmy, 5),
+         crisis_natural_disaster = na_if(crisis_natural_disaster, 3),
+         crisis_debt = na_if(crisis_debt, 3),
+         crisis_unemployment = na_if(crisis_unemployment, 3),
+         crisis_refugees = na_if(crisis_refugees, 3),
+         crisis_climate_ch = na_if(crisis_climate_ch, 3),
+         crisis_pandemic = na_if(crisis_pandemic, 3), 
+         crisis_military_attack = na_if(crisis_military_attack, 3),
+         democsatisfaction_country = na_if(democsatisfaction_country, 11),
+         democsatisfaction_eu = na_if(democsatisfaction_eu, 11),
+         selfidentity = na_if(selfidentity, 6),
+         countrydefence = na_if(countrydefence, 4),
+         russia = na_if(russia, 4),
+         natoimportance = na_if(natoimportance, 5),
+         leftright = ifelse(leftright %in% c(8, 100), NA, leftright),
+         ukraine_refugees = na_if(ukraine_refugees, 5),
+         economicsituation = na_if(economicsituation, 6),
+         areatype = na_if(areatype, 6)) 
+  
+
+colSums(is.na(sie_working))
+
+# I removed all observations for which >= 15,000 observations have NA (25%)
+
+sie_working <- sie_working %>% 
+  select(-starts_with("euled"), -country_influential,
+         -pastvote, -party_name_short_parlgov, euresource_taxes) %>% 
+  mutate(ukraine_memb = 5 - ukraine_memb)
+
+party_fam_dummies <- model.matrix(~ family_name_parlgov - 1, data = sie_working)
+sie_working <- cbind(sie_working, party_fam_dummies)
+
+sie_working <- sie_working %>% 
+  select(-family_name_parlgov, -family_name_parlgov.)
+
+sie_working$left_right_parlgov[sie_working$left_right_parlgov == ""] <- NA
+sie_working$left_right_parlgov[sie_working$left_right_parlgov == ","] <- NA
+
+sie_working$left_right_parlgov <- as.numeric(as.character(sie_working$left_right_parlgov))
+
+# I decide for listwise deletion which gives me close to 10,000 observations at the end with full data
+
+sie_working <- na.omit(sie_working)
+
+```
+
+```{r - Creating the First-Order-Interactions}
+
+y <- sie_working$ukraine_memb
+
+predictors <- as.data.frame(sie_working[, setdiff(names(sie_working), "ukraine_memb")])
+
+# I created First-Order-Interactions to have more variables to reliably test the different methods
+
+sie_working <- as.data.frame(model.matrix(~ .^2, data = predictors)[, -1])
+sie_working$ukraine_memb <- y
+
+```
+
+
+```{r - Train and Test Data Setup}
+
+set.seed(123)
+
+n <- nrow(sie_working)
+
+# I choose to do a Training/Test split of 80/20.
+# This is a bit arbitrary, as other splits would also be possible
+
+train_Index <- sample(n, size = 0.8 * n)
+
+train_data <- sie_working[train_Index, ]
+test_data <- sie_working[-train_Index, ]
+
+```
+
+```{r - Parallelization Start}
+
+# Paralellization so my code runs faster (particularly for the Random Forests)
+
+cores <- parallel::detectCores() - 1
+cl <- makeCluster(cores)
+registerDoParallel(cl)
+
+```
+
+
+## OLS Baseline
+
+```{r - OLS Baseline Model}
+
+set.seed(123)
+
+# I tried cross-validation (cv) for the OLS baseline just out of interest
+
+K <- 10
+n_train <- nrow(train_data)
+
+fold_id <- sample(rep(1:K, length.out = n_train))
+
+cv_mse <- numeric(K)
+
+for (k in 1:K) {
+  
+  train_data_k <- train_data[fold_id != k, ]
+  test_data_k  <- train_data[fold_id == k, ]
+  
+  model_ols <- lm(ukraine_memb ~ ., data = train_data_k)
+  
+  pred_k <- predict(model_ols, newdata = test_data_k)
+  
+  cv_mse[k] <- mean((test_data_k$ukraine_memb - pred_k)^2)
+}
+
+model_ols_mse <- mean(cv_mse)
+model_ols_mse
+
+model_ols_final <- lm(ukraine_memb ~ ., data = train_data)
+
+pred_test <- predict(model_ols_final, newdata = test_data)
+
+model_ols_test_mse <- round(mean((test_data$ukraine_memb - pred_test)^2), 4)
+model_ols_test_mse
+
+# Standard Error
+
+errors_ols <- (test_data$ukraine_memb - pred_test)^2
+se_ols <- sd(errors_ols) / sqrt(length(errors_ols))
+se_ols
+
+```
+
+## Lasso
+
+```{r - Lasso Model with Lambda min}
+
+set.seed(123)
+
+lasso_train <- model.matrix(ukraine_memb ~ ., data = train_data)
+lasso_y_train <- train_data$ukraine_memb
+
+lasso_test  <- model.matrix(ukraine_memb ~ ., data = test_data)
+lasso_y_test  <- test_data$ukraine_memb
+
+# Using cross-validation
+
+lasso_cv <- cv.glmnet(lasso_train, lasso_y_train, alpha = 1)
+
+# Setting lambda min. to get the best possible prediction
+
+lasso_minlambda <- predict(lasso_cv, newx = lasso_test, s = "lambda.min")
+
+mse_lasso_minlambda <- round(mean((lasso_y_test - lasso_minlambda)^2), 4)
+mse_lasso_minlambda
+
+# Standard Error
+
+se_lasso_minlambda <- sd((lasso_y_test - lasso_minlambda)^2) / sqrt(length(lasso_y_test))
+se_lasso_minlambda
+
+```
+
+
+```{r - Lasso Model with 1SE Lambda}
+
+set.seed(123)
+
+# Using cross-validation
+
+lasso_cv <- cv.glmnet(lasso_train, lasso_y_train, alpha = 1)
+
+# I wanted to try what result lambda 1se gives me
+
+lasso_lambda_one_se <- predict(lasso_cv, newx = lasso_test, s = "lambda.1se")
+
+mse_lasso_lambda_one_se <- round(mean((lasso_y_test - lasso_lambda_one_se)^2), 4)
+mse_lasso_lambda_one_se
+
+```
+
+## Ridge
+
+```{r - Ridge Model with Lamdba min}
+
+set.seed(123)
+
+ridge_train <- model.matrix(ukraine_memb ~ ., data = train_data)
+ridge_y_train <- train_data$ukraine_memb
+
+ridge_test  <- model.matrix(ukraine_memb ~ ., data = test_data)
+ridge_y_test  <- test_data$ukraine_memb
+
+# Using cross-validation
+
+ridge_cv <- cv.glmnet(ridge_train, ridge_y_train, alpha = 0)
+
+# Setting lambda min. for to get the best possible prediction
+
+ridge_minlambda <- predict(ridge_cv, newx = ridge_test, s = "lambda.min")
+
+mse_ridge_minlambda <- round(mean((ridge_y_test - ridge_minlambda)^2), 4)
+mse_ridge_minlambda
+
+# Standard Error
+
+se_ridge_minlambda <- sd((ridge_y_test - ridge_minlambda)^2) / sqrt(length(ridge_y_test))
+se_ridge_minlambda
+
+```
+
+
+```{r - Ridge Model with 1SE Lambda}
+
+set.seed(123)
+
+# Using cross-validation
+
+ridge_cv <- cv.glmnet(ridge_train, ridge_y_train, alpha = 0)
+
+# I wanted to try what result lambda 1se gives me
+
+ridge_lambda_one_se <- predict(ridge_cv, newx = ridge_test, s = "lambda.1se")
+
+mse_ridge_lambda_one_se <- round(mean((ridge_y_test - ridge_lambda_one_se)^2), 4)
+mse_ridge_lambda_one_se
+
+```
+
+## Random Forest
+
+```{r - Random Forest Model various Specifications}
+
+set.seed(123)
+
+# Defining the folds for cross-validation
+
+folds <- vfold_cv(train_data, v = 10)
+
+# Supporting the parallelization
+
+ctrl <- control_grid(
+  allow_par = TRUE,
+  parallel_over = "everything"
+)
+
+rf_model <- 
+  rand_forest(
+    trees = tune(),
+    min_n = tune()
+  ) %>% 
+  set_engine("ranger", num.threads = cores) %>% 
+  set_mode("regression") # Regression task
+
+rf_wf <- workflow() %>% 
+  add_model(rf_model) %>% 
+  add_formula(ukraine_memb ~ .) 
+
+rf_tuned <- rf_wf %>%  
+  tune_grid(resamples = folds,
+            grid=expand_grid(min_n = c(10, 50, 100), # Different parameters for min. N per split
+                             trees = c(100, 500, 1000)), # Different parameters for N of trees
+            control = ctrl)
+
+rf_tuned %>%  
+  show_best(metric="rmse", n = 5)
+
+rf_best <- rf_tuned %>% 
+  select_best(metric="rmse")
+
+rf_final <- 
+  rf_wf %>% 
+  finalize_workflow(rf_best) %>%  
+  fit(data = train_data)
+
+rf_pred <- predict(rf_final, test_data) %>%
+  bind_cols(test_data)
+
+rf_mse <- round(mean((rf_pred$ukraine_memb - rf_pred$.pred)^2), 4)
+rf_mse
+
+# Standard Error
+
+errors_rf <- (rf_pred$ukraine_memb - rf_pred$.pred)^2
+se_rf <- sd(errors_rf) / sqrt(length(errors_rf))
+se_rf
+
+
+```
+
+```{r - Parallelization Stop}
+
+stopCluster(cl)
+
+```
+
+## For Latex
+
+```{r - Latex Transformation}
+
+# Horizontal Table
+
+mse_table_horizontal <- data.frame(
+  "OLS (Baseline)" = model_ols_test_mse,
+  "Lasso Lambda min." = mse_lasso_minlambda,
+  "Ridge Lambda min." = mse_ridge_minlambda,
+  "Random_Forest" = rf_mse
+)
+
+mse_table_horizontal
+
+latex_table_horizontal <- kable(mse_table_horizontal, format = "latex", booktabs = TRUE)
+
+cat(latex_table_horizontal)
+
+# With SEs
+
+mse_table_horizontal_se <- data.frame(
+  "OLS (Baseline)" = paste0(model_ols_test_mse, " (", round(se_ols, 6), ")"),
+  "Lasso Lambda min." = paste0(mse_lasso_minlambda, " (", round(se_lasso_minlambda, 6), ")"),
+  "Ridge Lambda min." = paste0(mse_ridge_minlambda, " (", round(se_ridge_minlambda, 6), ")"),
+  "Random_Forest" = paste0(rf_mse, " (", round(se_rf, 6), ")")
+)
+
+mse_table_horizontal_se
+
+latex_table_horizontal_se <- kable(
+  mse_table_horizontal_se,
+  format = "latex",
+  booktabs = TRUE,
+  escape = FALSE
+)
+
+cat(latex_table_horizontal_se)
+
+```
+
+
+```{r - Visualization Lasso and Ridge MSE with Lambda min (log)}
+
+lasso_data <- data.frame(
+  lambda = lasso_cv$lambda,
+  mse = lasso_cv$cvm,
+  model = "Lasso")
+
+ridge_data <- data.frame(
+  lambda = ridge_cv$lambda,
+  mse = ridge_cv$cvm,
+  model = "Ridge")
+
+combined_lasso_ridge <- rbind(lasso_data, ridge_data)
+
+lasso_lambda_min <- lasso_cv$lambda.min
+lasso_mse_min <- min(lasso_cv$cvm)
+
+ridge_lambda_min <- ridge_cv$lambda.min
+ridge_mse_min <- min(ridge_cv$cvm)
+
+lasso_ridge_comparison <- ggplot(combined_lasso_ridge, aes(x = log(lambda), y = mse, color = model)) +
+  geom_line(linewidth = 1) +
+  labs(x = "log(Lambda)", y = "MSE", color = "", title = "Figure 1: Comparison between Lasso and Ridge with min Lambda") +
+  geom_vline(xintercept = log(lasso_cv$lambda.min), linetype = "dashed") +
+  geom_vline(xintercept = log(ridge_cv$lambda.min), linetype = "solid") +
+  geom_hline(yintercept = lasso_mse_min, linetype = "dashed") +
+  geom_hline(yintercept = ridge_mse_min, linetype = "solid") +
+  annotate("text",
+           x = log(lasso_lambda_min),
+           y = lasso_mse_min,
+           label = paste0("Lambda min: ", round(log(lasso_lambda_min), 2),
+                          "\nMSE: ", round(lasso_mse_min, 3)),
+           hjust = -0.09, vjust = -2.5, size = 3.5) +
+  annotate("text",
+           x = log(ridge_lambda_min),
+           y = ridge_mse_min,
+           label = paste0("Lambda min: ", round(log(ridge_lambda_min), 2),
+                          "\nMSE: ", round(ridge_mse_min, 3)),
+           hjust = -0.09, vjust = -1.5, size = 3.5) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+lasso_ridge_comparison
+
+ggsave("lasso_ridge_comparison.png",  width = 7, height = 7, plot = lasso_ridge_comparison)
+
+```
+
+```{r - Incuding also Ridge (log)}
+
+# Lasso Lambda min
+
+coef_matrix_lasso <- as.matrix(coef(lasso_cv, s = lasso_cv$lambda))
+
+num_predictors_lasso <- apply(coef_matrix_lasso, 2, function(x) sum(x[-1] != 0))
+
+lasso_num_predictors <- data.frame(
+  log_lambda = log(lasso_cv$lambda),
+  num_predictors_lasso = num_predictors_lasso
+)
+
+lasso_lambda_min <- lasso_cv$lambda.min
+lasso_mse_min <- min(lasso_cv$cvm)
+lasso_mse_min
+
+coef_min_lambda_lasso <- coef(lasso_cv, s = "lambda.min")
+num_predictors_min <- sum(coef_min_lambda_lasso[-1, , drop = TRUE] != 0)
+
+# Lasso Lambda 1se
+
+lasso_lambda_1se <- lasso_cv$lambda.1se
+
+coef_1se_lasso <- coef(lasso_cv, s = "lambda.1se")
+num_predictors_1se <- sum(coef_1se_lasso[-1, , drop = TRUE] != 0)
+
+lasso_mse_1se <- lasso_cv$cvm[lasso_cv$lambda == lasso_cv$lambda.1se]
+lasso_mse_1se
+
+lasso_min_point <- data.frame(
+  log_lambda = log(lasso_lambda_min),
+  num_predictors = num_predictors_min
+)
+
+lasso_1se_point <- data.frame(
+  log_lambda = log(lasso_lambda_1se),
+  num_predictors = num_predictors_1se
+)
+
+# Plot
+
+lasso_comparison_npredictors <- 
+  ggplot(lasso_num_predictors, aes(x = log_lambda, y = num_predictors_lasso)) +
+  geom_line(linewidth = 1) +
+  geom_point(
+  data = lasso_min_point,
+  aes(x = log_lambda, y = num_predictors),
+  inherit.aes = FALSE,
+  color = "black",
+  size = 3) +
+  geom_point(
+  data = lasso_1se_point,
+  aes(x = log_lambda, y = num_predictors),
+  inherit.aes = FALSE,
+  color = "black",
+  size = 3) +
+  geom_vline(xintercept = log(lasso_lambda_min), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = log(lasso_lambda_1se), linetype = "dashed", color = "black") +
+  annotate("text",
+           x = log(lasso_lambda_min),
+           y = num_predictors_min,
+           label = paste0(
+             "Lambda min\nN Predictors: ", num_predictors_min,
+             "\nMSE: ", round(lasso_mse_min, 3)),
+           hjust = 1.1,
+           vjust = 1.25,
+           size = 3.5,
+           color = "black") +
+  annotate("text",
+           x = log(lasso_lambda_1se),
+           y = num_predictors_1se,
+           label = paste0(
+             "Lambda 1se\nN Predictors: ", num_predictors_1se,
+             "\nMSE: ", round(lasso_mse_1se, 3)),
+           hjust = -0.1,
+           vjust = -0.25,
+           size = 3.5,
+           color = "black") +
+  labs(x = "log(Lambda)", y = "Number of Selected Predictors", title = "Figure 2: Predictor Selection in Lasso") +
+  theme_bw()
+
+lasso_comparison_npredictors
+
+ggsave("lasso_comparison_npredictors.png",  width = 7, height = 7, plot = lasso_comparison_npredictors)
+
+
+```
+
+```{r - Tree-based Regression Visualization}
+
+rf_results_plot <- rf_tuned %>%
+  collect_metrics() %>% 
+  filter(.metric == "rmse")  %>% 
+  mutate(mse = mean^2) %>% 
+  arrange(mse)
+
+random_forests <- ggplot(rf_results_plot, aes(
+  x = factor(min_n),
+  y = mse, fill = factor(trees))) +
+  geom_col(position = "dodge") +
+  coord_cartesian(ylim = c(0.7, 0.74)) +
+  scale_fill_manual(values = c(
+  "100" = "darkblue",
+  "500" = "orange",
+  "1000" = "darkgreen")) +
+  scale_x_discrete(labels = function(x) {
+    gsub("\\.", " / ", x)
+  }) +
+  labs(
+    x = "Min N per Split",
+    y = "MSE", fill = "N of Trees", title = "Figure 3: Different Combinations of Random Forests") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+random_forests
+
+ggsave("random_forests.png", width = 7, height = 7, plot = random_forests)
+
+```
+
+
